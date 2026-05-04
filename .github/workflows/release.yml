@@ -5,6 +5,9 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: write
+
 jobs:
   build-release:
     runs-on: ubuntu-latest
@@ -31,7 +34,8 @@ jobs:
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
-          files: "./release/mosdns*.zip"
+          files: "./release/mosdns-socks5-plus*.zip"
+          generate_release_notes: true
           prerelease: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
