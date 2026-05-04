@@ -78,7 +78,6 @@ type Opt struct {
 
 	// Socks5 specifies the socks5 proxy server that the upstream
 	// will connect though.
-	// Not implemented for udp based protocols (aka. dns over udp, http3, quic).
 	Socks5 string
 
 	// SoMark sets the socket SO_MARK option in unix system.
@@ -271,6 +270,17 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 		}
 	}
 
+	// getPacketConn creates a net.PacketConn for QUIC-based protocols.
+	// If SOCKS5 is configured, it establishes UDP ASSOCIATE; otherwise it creates
+	// a plain UDP socket with socket options applied.
+	getPacketConn := func(ctx context.Context, s5Addr string, targetAddr string, so socketOpts) (net.PacketConn, error) {
+		if len(s5Addr) > 0 {
+			return newSocks5UdpPacketConn(ctx, s5Addr, targetAddr, dialer)
+		}
+		lc := net.ListenConfig{Control: getSocketControlFunc(so)}
+		return lc.ListenPacket(ctx, "udp", "")
+	}
+
 	switch addrURL.Scheme {
 	case "", "udp":
 		const defaultPort = 53
@@ -285,9 +295,19 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 		dialAddr := joinPort(host, port)
 
 		dialUdpPipeline := func(ctx context.Context) (transport.DnsConn, error) {
-			c, err := dialer.DialContext(ctx, "udp", dialAddr)
-			if err != nil {
-				return nil, err
+			var c net.Conn
+			if s5Addr := opt.Socks5; len(s5Addr) > 0 {
+				s5Conn, err := newSocks5UdpConn(ctx, s5Addr, dialAddr, dialer)
+				if err != nil {
+					return nil, fmt.Errorf("failed to init socks5 udp conn, %w", err)
+				}
+				c = s5Conn
+			} else {
+				var err error
+				c, err = dialer.DialContext(ctx, "udp", dialAddr)
+				if err != nil {
+					return nil, err
+				}
 			}
 			to := transport.TraditionalDnsConnOpts{
 				WithLengthHeader:   false,
@@ -296,8 +316,12 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 			}
 			return transport.NewDnsConn(to, wrapConn(c, opt.EventObserver)), nil
 		}
+		tcpDialFn, err := newTcpDialer(true, defaultPort)
+		if err != nil {
+			return nil, err
+		}
 		dialTcpNetConn := func(ctx context.Context) (transport.NetConn, error) {
-			c, err := dialer.DialContext(ctx, "tcp", dialAddr)
+			c, err := tcpDialFn(ctx)
 			if err != nil {
 				return nil, err
 			}
@@ -415,8 +439,11 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 				return nil, fmt.Errorf("failed to init udp addr bootstrap, %w", err)
 			}
 
-			lc := net.ListenConfig{Control: getSocketControlFunc(socketOpts{so_mark: opt.SoMark, bind_to_device: opt.BindToDevice})}
-			conn, err := lc.ListenPacket(context.Background(), "udp", "")
+			targetUa, err := udpBootstrap(context.Background())
+			if err != nil {
+				return nil, fmt.Errorf("failed to resolve target address, %w", err)
+			}
+			conn, err := getPacketConn(context.Background(), opt.Socks5, targetUa.String(), socketOpts{so_mark: opt.SoMark, bind_to_device: opt.BindToDevice})
 			if err != nil {
 				return nil, fmt.Errorf("failed to init udp socket for quic, %w", err)
 			}
@@ -426,8 +453,9 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 			quicConfig := newDefaultClientQuicConfig()
 			quicConfig.MaxIdleTimeout = idleConnTimeout
 
+			defer closeIfFuncErr(conn)
 			defer closeIfFuncErr(quicTransport)
-			addonCloser = quicTransport
+			addonCloser = compositeCloser{quicTransport, conn}
 			t = &http3.Transport{
 				TLSClientConfig: opt.TLSConfig,
 				QUICConfig:      quicConfig,
@@ -509,16 +537,21 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 			opt.Logger.Warn("failed to init quic stateless reset key, it will be disabled", zap.Error(err))
 		}
 
-		lc := net.ListenConfig{Control: getSocketControlFunc(socketOpts{so_mark: opt.SoMark, bind_to_device: opt.BindToDevice})}
-		uc, err := lc.ListenPacket(context.Background(), "udp", "")
+		targetUa, err := udpBootstrap(context.Background())
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve target address, %w", err)
+		}
+		uc, err := getPacketConn(context.Background(), opt.Socks5, targetUa.String(), socketOpts{so_mark: opt.SoMark, bind_to_device: opt.BindToDevice})
 		if err != nil {
 			return nil, fmt.Errorf("failed to init udp socket for quic, %w", err)
 		}
+		defer closeIfFuncErr(uc)
 
 		t := &quic.Transport{
 			Conn:              uc,
 			StatelessResetKey: (*quic.StatelessResetKey)(srk),
 		}
+		defer closeIfFuncErr(t)
 
 		dialDnsConn := func(ctx context.Context) (transport.DnsConn, error) {
 			ua, err := udpBootstrap(ctx)
@@ -542,12 +575,13 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 			return transport.NewQuicDnsConn(c), nil
 		}
 
-		return transport.NewPipelineTransport(transport.PipelineOpts{
+		pt := transport.NewPipelineTransport(transport.PipelineOpts{
 			DialContext: dialDnsConn,
 			// Quic rfc recommendation is 100. Some implications use 65535.
 			MaxConcurrentQueryWhileDialing: 90,
 			Logger:                         opt.Logger,
-		}), nil
+		})
+		return &quicWithClose{PipelineTransport: pt, closers: []io.Closer{t, uc}}, nil
 	default:
 		return nil, fmt.Errorf("unsupported protocol [%s]", addrURL.Scheme)
 	}
@@ -573,6 +607,29 @@ func (u *udpWithFallback) ExchangeContext(ctx context.Context, q []byte) (*[]byt
 func (u *udpWithFallback) Close() error {
 	u.u.Close()
 	u.t.Close()
+	return nil
+}
+
+type quicWithClose struct {
+	*transport.PipelineTransport
+	closers []io.Closer
+}
+
+func (q *quicWithClose) Close() error {
+	q.PipelineTransport.Close()
+	for _, c := range q.closers {
+		c.Close()
+	}
+	return nil
+}
+
+// compositeCloser closes multiple io.Closer instances in order.
+type compositeCloser []io.Closer
+
+func (c compositeCloser) Close() error {
+	for _, closer := range c {
+		closer.Close()
+	}
 	return nil
 }
 
